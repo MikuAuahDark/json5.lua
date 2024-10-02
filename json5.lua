@@ -21,6 +21,7 @@
 -- SOFTWARE.
 
 
+---@type string[]|table<string,boolean>
 local whitespace = {
 	"\225\154\128",
 	"\226\128\128",
@@ -49,6 +50,7 @@ local whitespace = {
 	" ",
 }
 
+---@type string[]|table<string,boolean>
 local newlineChars = {
 	"\226\128\168",
 	"\226\128\169",
@@ -56,6 +58,15 @@ local newlineChars = {
 	"\r", -- CR
 	"\n", -- LF
 }
+
+local function MAKE_LOOKUP(t)
+	for i, v in ipairs(t) do
+		t[v] = true
+	end
+end
+
+MAKE_LOOKUP(whitespace)
+MAKE_LOOKUP(newlineChars)
 
 local escaper = {
 	["0"] = "\0",
@@ -74,21 +85,30 @@ local function Q(obj)
 	return (string.format("%q", obj):gsub("\r", "\\r"):gsub("\n", "\\n"))
 end
 
----@param text string
-local function getWhitespace(text)
-	for _, w in ipairs(whitespace) do
-		if text:sub(1, #w) == w then
-			return w
-		end
+---@param message string
+---@param rowcol {[1]:integer,[2]:integer}
+local function formatError(message, rowcol)
+	local errstr = string.format("%s at line %d col %d", message, rowcol[1], rowcol[2])
+	error(errstr, 2)
+end
+
+---@param ws string
+---@param rowcol {[1]:integer,[2]:integer}
+local function advanceNewline(ws, rowcol)
+	if newlineChars[ws] then
+		rowcol[1] = rowcol[1] + 1
+		rowcol[2] = 1
+		return true
 	end
 
-	return nil
+	return false
 end
 
 ---@param text string
-local function getNewline(text)
+---@param rowcol {[1]:integer,[2]:integer}
+local function getNewline(text, rowcol)
 	for _, nl in ipairs(newlineChars) do
-		if text:sub(1, #nl) == nl then
+		if text:sub(1, #nl) == nl and advanceNewline(nl, rowcol) then
 			return nl
 		end
 	end
@@ -97,58 +117,82 @@ local function getNewline(text)
 end
 
 ---@param text string
-local function stripWhitespace(text)
-	local newlines = 0
+---@param rowcol {[1]:integer,[2]:integer}
+local function getWhitespace(text, rowcol)
+	for _, w in ipairs(whitespace) do
+		if text:sub(1, #w) == w then
+			rowcol[2] = rowcol[2] + #w
+			advanceNewline(w, rowcol)
+			return w
+		end
+	end
 
+	return nil
+end
+
+---@param text string
+---@param rowcol {[1]:integer,[2]:integer}
+local function stripWhitespace(text, rowcol)
 	-- This is quite expensive, O(n^2)
 	while true do
-		local ws = getWhitespace(text)
+		local ws = getWhitespace(text, rowcol)
 
 		if ws == nil then
 			break
-		elseif getNewline(ws) then
-			newlines = newlines + 1
 		end
 
 		text = text:sub(#ws + 1)
 	end
 
-	return text, newlines
+	return text
 end
 
 ---@param text string
-local function stripInlineComments(text)
+---@param rowcol {[1]:integer,[2]:integer}
+local function stripInlineComments(text, rowcol)
 	-- Find newline
 	while true do
 		if #text == 0 then
 			-- EOF
-			return "", 0
+			break
 		end
 
-		local nl = getNewline(text)
+		local nl = getNewline(text, rowcol)
 		if nl then
 			text = text:sub(#nl + 1)
 			break
 		end
 
 		text = text:sub(2)
+		rowcol[2] = rowcol[2] + 1
 	end
 
-	return text, 1
+	return text
 end
 
 ---@param text string
----@return string|nil
----@return integer|string
-local function stripBlockComments(text)
-	-- Find block comment close tag
-	local stopComment = text:find("*/", 1, true)
-	if not stopComment then
-		return nil, "missing multiline comment close tag"
+---@param rowcol {[1]:integer,[2]:integer}
+---@return string
+local function stripBlockComments(text, rowcol)
+	-- This is bit expensive but it's necessary for proper row column support
+	while #text > 0 do
+		-- Found block comment close tag
+		if text:sub(1, 2) == "*/" then
+			rowcol[2] = rowcol[2] + 2
+			return text:sub(3)
+		end
+
+		local nl = getNewline(text, rowcol)
+		if nl then
+			text = text:sub(#nl + 1)
+		else
+			rowcol[2] = rowcol[2] + 1
+			text = text:sub(2)
+		end
 	end
 
-	local newlines = select(2, text:sub(1, stopComment):gsub("\n", ""))
-	return text:sub(stopComment + 2), newlines
+	formatError("missing multiline comment close tag", rowcol)
+	return ""
 end
 
 ---Copied and modified slightly from rxi/json
@@ -174,17 +218,19 @@ local function codepointToutf8(n)
 end
 
 ---@param text string includes the "\u"
-local function parseUnicodeImpl(text)
-	local hexcode = text:match("\\u(%x%x%x%x)")
+---@param rowcol {[1]:integer,[2]:integer}
+local function parseUnicodeImpl(text, rowcol)
+	local hexcode = text:match("^\\u(%x%x%x%x)")
 	if not hexcode then
-		return nil, "invalid unicode hex escape sequence"
+		formatError("invalid unicode hex escape sequence", rowcol)
 	end
 
 	local utf16code = tonumber(hexcode, 16)
 	if not utf16code then
-		return nil, "invalid unicode hex escape sequence"
+		formatError("invalid unicode hex escape sequence", rowcol)
 	end
 
+	rowcol[2] = rowcol[2] + 6
 	return utf16code, text:sub(7)
 end
 
@@ -195,43 +241,39 @@ local function getSurrogatePair(low, high)
 end
 
 ---@param text string includes the "\u"
----@return string|nil
----@return string
-local function parseUnicode(text)
-	local num, msg = parseUnicodeImpl(text)
-	if not num then
-		return nil, msg
-	end
-
-	text = msg
+---@param rowcol {[1]:integer,[2]:integer}
+local function parseUnicode(text, rowcol)
+	local row, col = rowcol[1], rowcol[2] -- for codepointToUTF8
+	local num
+	num, text = parseUnicodeImpl(text, rowcol)
 
 	-- Is it surrogate pair?
 	if num >= 0xd800 and num < 0xdc00 then
 		-- High surrogate pair. Need low surrogate pair.
 		local lownum
-		lownum, msg = parseUnicodeImpl(text)
+		lownum, text = parseUnicodeImpl(text, rowcol)
 		if lownum and lownum >= 0xdc00 and lownum <= 0xdfff then
 			num = getSurrogatePair(lownum, num)
-			text = msg
 		end
 		-- TODO: Should we error in case of invalid pairs?
 	end
 
 	local utf8text, errmsg = codepointToutf8(num)
-	if utf8text then
-		return utf8text, text
+	if not utf8text then
+		---@cast errmsg -nil
+		formatError(errmsg, {row, col})
 	end
 
-	---@cast errmsg -nil
-	return nil, errmsg
+	---@cast utf8text -nil
+	return utf8text, text
 end
 
 ---@param text string
 ---@param stop fun(text:string):boolean
 ---@param identifierMode boolean
-local function parseStringImpl(text, stop, identifierMode)
+---@param rowcol {[1]:integer,[2]:integer}
+local function parseStringImpl(text, stop, identifierMode, rowcol)
 	local result = {}
-	local newlines = 0
 
 	while true do
 		if stop(text) then
@@ -240,48 +282,50 @@ local function parseStringImpl(text, stop, identifierMode)
 
 		local char = text:sub(1, 1)
 
+		-- Escape sequence?
 		if char == "\\" then
 			local what = text:sub(2, 2)
+			rowcol[2] = rowcol[2] + 1
 
 			if escaper[what] then
+				rowcol[2] = rowcol[2] + 1
+
 				if identifierMode then
-					return false, "escape sequence not allowed", newlines, text
+					formatError("escape sequence not allowed", rowcol)
 				end
 
 				result[#result+1] = escaper[what]
 				text = text:sub(3)
 			elseif what == "u" then
 				-- Unicode escape
-				local unicode, err = parseUnicode(text)
-				if not unicode then
-					return false, err, newlines, text
-				end
-
+				local unicode
+				unicode, text = parseUnicode(text, rowcol)
 				result[#result+1] = unicode
-				text = err -- "\uHHHH" optionally followed by 1 another "\uHHHH" for surrogate pair
 			elseif what == "x" then
 				if identifierMode then
-					return false, "hex escape sequence not allowed", newlines, text
+					formatError("hex escape sequence not allowed", rowcol)
 				end
+
+				rowcol[2] = rowcol[2] + 2
 
 				local hexstr = text:sub(2, 3)
 				local hexnum = tonumber(hexstr, 16)
 				if not hexnum then
-					return false, "invalid hex escape sequence", newlines, text
+					formatError("invalid hex escape sequence", rowcol)
 				end
 
 				result[#result+1] = string.char(hexnum)
+				rowcol[2] = rowcol[2] + 2
 				text = text:sub(5) -- "\xHH"
 			else
 				if identifierMode then
-					return false, "invalid escape sequence", newlines, text
+					formatError("invalid escape sequence", rowcol)
 				end
 
-				local nl = getNewline(text:sub(2))
+				local nl = getNewline(text:sub(2), rowcol)
 				local ignore = 2
 				if nl then
 					-- JSON5 allows string spanning multiple lines by escaping newline
-					newlines = newlines + 1
 					ignore = #nl + 2
 				end
 
@@ -289,55 +333,61 @@ local function parseStringImpl(text, stop, identifierMode)
 				text = text:sub(ignore)
 			end
 		elseif char:byte(1, 1) < 32 then
-			return false, "control character found", newlines, text
+			formatError("control character found", rowcol)
 		else
 			result[#result+1] = char
 			text = text:sub(2)
+			rowcol[2] = rowcol[2] + 1
 		end
 	end
 
-	return true, table.concat(result), newlines, text
+	return table.concat(result), text
 end
 
 ---@param text string including the delimiter
-local function parseString(text)
-	local stop = text:sub(1, 1)
+---@param rowcol {[1]:integer,[2]:integer}
+local function parseString(text, rowcol)
+	local stop, value = text:sub(1, 1), nil
 
-	local success, value, newlines, newText = parseStringImpl(
-		text:sub(2),
-		function(txt) return txt:sub(1, 1) == stop end,
-		false
-	)
-
-	if success then
-		newText = newText:sub(2)
+	---@param txt string
+	---@return boolean
+	local function stopCriterion(txt)
+		return txt:sub(1, 1) == stop
 	end
 
-	return success, value, newlines, newText
+	value, text = parseStringImpl(text:sub(2), stopCriterion, false, rowcol)
+	rowcol[2] = rowcol[2] + 1
+	return value, text:sub(2)
 end
 
-local nan = 0/0
+local NaN = 0/0
 
 ---@param text string
-local function parseNumber(text)
+---@param rowcol {[1]:integer,[2]:integer}
+local function parseNumber(text, rowcol)
 	local sign = 1
 	local signchar = text:sub(1, 1)
+	local row, col = rowcol[1], rowcol[2] -- for tonumber parsing
 
 	if signchar == "+" then
 		sign = 1
 		text = text:sub(2)
+		rowcol[2] = rowcol[2] + 1
 	elseif signchar == "-" then
 		sign = -1
 		text = text:sub(2)
+		rowcol[2] = rowcol[2] + 1
 	end
 
 	if text:sub(1, 3) == "NaN" then
-		return true, nan, 0, text:sub(4)
+		rowcol[2] = rowcol[2] + 3
+		return NaN, text:sub(4)
 	end
 
 	local infText = text:find("Infinity", 1, true)
 	if infText == 1 then
-		return true, math.huge * sign, 0, text:sub(9)
+		rowcol[2] = rowcol[2] + 8
+		return math.huge * sign, text:sub(9)
 	end
 
 	-- TODO: Bring our own number parsing for Lua 5.1?
@@ -345,7 +395,7 @@ local function parseNumber(text)
 	local lookText = text
 
 	while true do
-		if getWhitespace(lookText) then
+		if getWhitespace(lookText, rowcol) then
 			break
 		end
 
@@ -355,6 +405,7 @@ local function parseNumber(text)
 
 		potentialNum = potentialNum + 1
 		lookText = lookText:sub(2)
+		rowcol[2] = rowcol[2] + 1
 	end
 
 	local numval = text:sub(1, potentialNum)
@@ -368,125 +419,123 @@ local function parseNumber(text)
 		num = tonumber(numval)
 	end
 	if num == nil then
-		return false, "invalid number sequence "..Q(numval), 0, text
+		formatError("invalid number sequence "..Q(numval), {row, col})
 	end
 
-	return true, num * sign, 0, text:sub(potentialNum + 1)
+	rowcol[2] = rowcol[2] + potentialNum
+	---@cast num -nil
+	return num * sign, text:sub(potentialNum + 1)
 end
 
 ---@param text string
+---@param rowcol {[1]:integer,[2]:integer}
 ---@param nullval any
-local function parseNull(text, nullval)
+local function parseNull(text, rowcol, nullval)
 	if text:sub(1, 4) ~= "null" then
-		return false, "invalid null literal", 0, text
+		formatError("invalid null literal", rowcol)
 	end
 
-	return true, nullval, 0, text:sub(5)
+	rowcol[2] = rowcol[2] + 1
+	return nullval, text:sub(5)
 end
 
 ---@param text string
-local function parseBoolean(text)
+---@param rowcol {[1]:integer,[2]:integer}
+local function parseBoolean(text, rowcol)
 	if text:sub(1, 4) == "true" then
-		return true, true, 0, text:sub(5)
+		rowcol[2] = rowcol[2] + 4
+		return true, text:sub(5)
 	elseif text:sub(1, 5) == "false" then
-		return true, false, 0, text:sub(6)
+		rowcol[2] = rowcol[2] + 5
+		return false, text:sub(6)
 	else
-		return false, "invalid boolean literal", 0, text
+		formatError("invalid boolean literal", rowcol)
 	end
+
+	return false -- unreachable
 end
 
 ---@param text string
-local function stripComments(text)
+---@param rowcol {[1]:integer,[2]:integer}
+local function stripComments(text, rowcol)
 	local s = text:sub(1, 2)
 	if s == "//" then
-		return stripInlineComments(text:sub(3))
+		rowcol[2] = rowcol[2] + 2
+		return stripInlineComments(text:sub(3), rowcol)
 	elseif s == "/*" then
-		return stripBlockComments(text:sub(3))
+		rowcol[2] = rowcol[2] + 2
+		return stripBlockComments(text:sub(3), rowcol)
 	end
 
-	return text, 0
+	return text
 end
 
 ---@param text string
-local function stripWhitespaceAndComments(text)
-	local newlines = 0
-
+---@param rowcol {[1]:integer,[2]:integer}
+local function stripWhitespaceAndComments(text, rowcol)
 	while true do
-		local txt, nl = stripWhitespace(text)
-		local txt2, nl2 = stripComments(txt)
+		local txt = stripWhitespace(text, rowcol)
+		txt = stripComments(txt, rowcol)
 
-		if not txt2 then
-			---@cast nl2 string
-			return false, nl2, newlines + nl
-		end
-
-		newlines = newlines + nl + nl2
-		if txt2 == text then
+		if txt == text then
 			break
 		end
 
-		text = txt2
+		text = txt
 	end
 
-	return true, text, newlines
+	return text
 end
+
+---@alias json5.Value nil|number|boolean|string|json5.Array|json5.Object
+---@alias json5.Array json5.Value[]
+---@alias json5.Object table<string, json5.Value>
 
 local parseValue
 
 ---@param text string
+---@param rowcol {[1]:integer,[2]:integer}
 ---@param nullval any
----@return boolean,any[]|string,integer,string
-local function parseArray(text, nullval)
+---@return json5.Array,string
+local function parseArray(text, rowcol, nullval)
 	text = text:sub(2)
+	rowcol[2] = rowcol[2] + 1
 
 	local result = {}
-	local newlines = 0
 
 	while true do
-		local success, newText, nl = stripWhitespaceAndComments(text)
-		if not success then
-			return false, newText, newlines + nl, text
-		end
+		text = stripWhitespaceAndComments(text, rowcol)
 
-		newlines = newlines + nl
-
-		if newText:sub(1, 1) == "]" then
+		if text:sub(1, 1) == "]" then
 			-- Finish
-			text = newText:sub(2)
+			rowcol[2] = rowcol[2] + 1
+			text = text:sub(2)
 			break
 		end
 
 		local value
-		success, value, nl, newText = parseValue(newText, nullval)
-		newlines = newlines + nl
-
-		if not success then
-			return false, value, newlines, newText
-		end
-
-		local newText2
-		success, newText2, nl = stripWhitespaceAndComments(newText)
-		newlines = newlines + nl
-		if not success then
-			return false, newText2, newlines, newText
-		end
+		value, text = parseValue(text, rowcol, nullval)
+		text = stripWhitespaceAndComments(text, rowcol)
 
 		-- Insert
 		result[#result+1] = value
 
 		-- Continue or finish?
-		local lastOrNext = newText2:sub(1, 1)
-		text = newText2:sub(2)
+		local lastOrNext = text:sub(1, 1)
+		text = text:sub(2)
 
 		if lastOrNext == "]" then
 			-- Finish
+			rowcol[2] = rowcol[2] + 1
 			break
 		elseif lastOrNext ~= "," then
-			return false, "expected comma got \""..lastOrNext.."\"", newlines, newText2
+			formatError("expected comma got "..Q(lastOrNext), rowcol)
 		end
+
+		rowcol[2] = rowcol[2] + 1
 	end
 
-	return true, result, newlines, text
+	return result, text
 end
 
 ---@param identifier string
@@ -528,129 +577,99 @@ end
 
 ---@param text string
 local function stopIdentifier(text)
-	return text:sub(1, 1) == ":" or getWhitespace(text) ~= nil
+	return text:sub(1, 1) == ":" or getWhitespace(text, {0, 0}) ~= nil
 end
 
 ---@param text string
-local function parseIdentifier(text)
+---@param rowcol {[1]:integer,[2]:integer}
+local function parseIdentifier(text, rowcol)
 	local first = text:sub(1, 1)
-	local identifier, newText
+	local identifier
 
 	if first == "'" or first == "\"" then
 		-- Quoted identifier
-		local success, _
-		success, identifier, _, newText = parseStringImpl(
-			text:sub(2),
-			function (txt) return txt:sub(1, 1) == first end,
-			true
-		)
-		if not success then
-			return false, identifier, newText
-		end
-
-		newText = newText:sub(2)
+		identifier, text = parseString(text, rowcol)
 	else
+		local row, col = rowcol[1], rowcol[2]
 		-- Unquoted identifier
-		local success, _
-		success, identifier, _, newText = parseStringImpl(text, stopIdentifier, true)
-		if not success then
-			return false, identifier, newText
-		end
+		identifier, text = parseStringImpl(text, stopIdentifier, true, rowcol)
 
 		-- Test identifier validity
 		if not testIdentifier(identifier) then
-			return false, "invalid identifier "..Q(identifier), newText
+			formatError("invalid identifier "..Q(identifier), {row, col})
 		end
 	end
 
-	return true, identifier, newText
+	return identifier, text
 end
 
 ---@param text string
+---@param rowcol {[1]:integer,[2]:integer}
 ---@param nullval any
----@return boolean,table<string,any>|string,integer,string
-local function parseObject(text, nullval)
+---@return json5.Object,string
+local function parseObject(text, rowcol, nullval)
+	rowcol[2] = rowcol[2] + 1
 	text = text:sub(2)
 
 	local result = {}
-	local newlines = 0
 
 	while true do
-		local success, newText, nl = stripWhitespaceAndComments(text)
-		newlines = newlines + nl
-		if not success then
-			return false, newText, newlines, text
-		end
+		text = stripWhitespaceAndComments(text, rowcol)
 
-		if newText:sub(1, 1) == "}" then
+		if text:sub(1, 1) == "}" then
 			-- Finish
-			text = newText:sub(2)
+			rowcol[2] = rowcol[2] + 1
+			text = text:sub(2)
 			break
 		end
 
 		-- Identifier
 		local identifier
-		success, identifier, newText = parseIdentifier(newText)
-		if not success then
-			return false, identifier, newlines, newText
+		identifier, text = parseIdentifier(text, rowcol)
+		text = stripWhitespaceAndComments(text, rowcol)
+
+		-- Colon
+		if text:sub(1, 1) ~= ":" then
+			formatError("expected colon after identifier, got "..Q(text:sub(1, 1)), rowcol)
 		end
 
-		local newText2
-		success, newText2, nl = stripWhitespaceAndComments(newText)
-		newlines = newlines + nl
-		if not success then
-			return false, newText2, newlines, newText
-		end
-
-		if newText2:sub(1, 1) ~= ":" then
-			return false, "expected colon after identifier, got "..Q(newText2:sub(1, 1)), newlines, newText
-		end
-
-		newText = newText2
+		rowcol[2] = rowcol[2] + 1
+		text = text:sub(2)
 
 		-- Value
-		success, newText2, nl = stripWhitespaceAndComments(newText)
-		newlines = newlines + nl
-		if not success then
-			return false, newText2, newlines, newText
-		end
-		newText = newText2:sub(2)
+		text = stripWhitespaceAndComments(text, rowcol)
 
 		local value
-		success, value, nl, newText = parseValue(newText, nullval)
-		newlines = newlines + nl
+		value, text = parseValue(text, rowcol, nullval)
 
-		if not success then
-			return false, value, newlines, newText
-		end
-
-		success, newText2, nl = stripWhitespaceAndComments(newText)
-		newlines = newlines + nl
-		if not success then
-			return false, newText2, newlines, newText
-		end
+		text = stripWhitespaceAndComments(text, rowcol)
 
 		-- Insert
 		result[identifier] = value
 
 		-- Continue or finish?
-		local lastOrNext = newText2:sub(1, 1)
-		text = newText2:sub(2)
+		local lastOrNext = text:sub(1, 1)
+		text = text:sub(2)
 
 		if lastOrNext == "}" then
 			-- Finish
+			rowcol[2] = rowcol[2] + 1
 			break
 		elseif lastOrNext ~= "," then
-			return false, "expected comma got \""..lastOrNext.."\"", newlines, newText2
+			formatError("expected comma got "..Q(lastOrNext), rowcol)
 		end
+
+		rowcol[2] = rowcol[2] + 1
 	end
 
-	return true, result, newlines, text
+	return result, text
 end
 
 ---@param text string
-local function catchEOF(text)
-	return false, "unexpected eof", 0, text
+---@param rowcol {[1]:integer,[2]:integer}
+local function catchEOF(text, rowcol)
+	formatError("unexpected eof", rowcol)
+	return nil -- unreachable
 end
 
 local valueTest = {
@@ -680,45 +699,23 @@ local valueTest = {
 }
 
 ---@param text string
-function parseValue(text, nullval)
-	local success, newText, newlines = stripWhitespaceAndComments(text)
-	if not success then
-		return false, newText, newlines, text
-	end
+---@param rowcol {[1]:integer,[2]:integer}
+---@param nullval any
+---@return json5.Value,string
+function parseValue(text, rowcol, nullval)
+	text = stripWhitespaceAndComments(text, rowcol)
 
-	local first = newText:sub(1, 1)
+	local first = text:sub(1, 1)
 	local func = valueTest[first]
 
 	if not func then
-		return false, "invalid value literal"..Q(first), newlines, newText
+		formatError("invalid value literal "..Q(first), rowcol)
 	end
 
-	local value, newlines2
-	success, value, newlines2, newText = func(newText, nullval)
-	return success, value, newlines + newlines2, newText
+	return func(text, rowcol, nullval)
 end
 
----@param message string
----@param fulltext string
----@param subtext string
----@param newlines integer
-local function formatError(message, fulltext, subtext, newlines)
-	local diff = fulltext:sub(1, #fulltext - #subtext)
-	local gotnewline = 0
 
-	while gotnewline < newlines do
-		local nl = diff:find("\n", 1, true)
-		if not nl then
-			break
-		end
-
-		gotnewline = gotnewline + 1
-		diff = diff:sub(nl + 1)
-	end
-
-	local errstr = string.format("%s at line %d col %d", message, gotnewline + 1, #diff + 1)
-	error(errstr, 2)
-end
 
 local json5 = {}
 
@@ -732,35 +729,22 @@ json5.null = newproxy(false)
 ---Decode JSON5 string to Lua value.
 ---@param text string JSON5 string.
 ---@param opts json5.opts? Additional option to specify. See `json5.opts` for more information.
----@return any
+---@return json5.Value
 function json5.decode(text, opts)
 	local nullval = nil
 	if opts then
 		nullval = opts.null
 	end
 
-	local success, newText, newlines = stripWhitespaceAndComments(text)
-	if not success then
-		formatError(newText, text, text, newlines)
-	end
+	local rowcol = {1, 1}
+	text = stripWhitespaceAndComments(text, rowcol)
 
-	local value, newlines2, newText2
-	success, value, newlines2, newText2 = parseValue(text, nullval)
-	newlines = newlines + newlines2
-	if not success then
-		---@cast value string
-		formatError(value, text, newText, newlines)
-	end
-	newText = newText2
+	local value
+	value, text = parseValue(text, rowcol, nullval)
+	text = stripWhitespaceAndComments(text, rowcol)
 
-	success, newText2, newlines2 = stripWhitespaceAndComments(newText)
-	newlines = newlines + newlines2
-	if not success then
-		formatError(newText2, text, newText, newlines)
-	end
-
-	if #newText2 > 0 then
-		formatError("trailing garbage", text, newText2, newlines)
+	if #text > 0 then
+		formatError("trailing garbage", rowcol)
 	end
 
 	return value
