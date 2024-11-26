@@ -119,6 +119,10 @@ end
 ---@param text string
 ---@param rowcol {[1]:integer,[2]:integer}
 local function getWhitespace(text, rowcol)
+	if #text == 0 then
+		return nil
+	end
+
 	for _, w in ipairs(whitespace) do
 		if text:sub(1, #w) == w then
 			rowcol[2] = rowcol[2] + #w
@@ -399,7 +403,8 @@ local function parseNumber(text, rowcol)
 			break
 		end
 
-		if lookText:sub(1, 1) == "," then
+		local next = lookText:sub(1, 1)
+		if next == "" or next == "," or next == "]" or next == "}" then
 			break
 		end
 
